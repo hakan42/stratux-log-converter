@@ -7,13 +7,26 @@ Aviation defaults:
   - Total distance in nautical miles (nm)
   - Speed interpreted as knots (kts)
 
-First section fix:
-  - All VALUES (the 2nd row of section 1) are quoted, even if empty.
-  - Header stays unquoted. Second section unchanged.
+Adds lightweight aerodrome detection:
+  - Provide --airports airports.csv (e.g., OurAirports format) to auto-fill
+    "Derived Origin" and "Derived Destination" with nearest ICAO idents.
+  - Configurable radius (--airport-threshold-nm, default 20nm) and ICAO-only filter.
 
-Usage:
+Examples:
   python stratux_sensors_to_foreflight_ffcsv.py sensors.csv -o foreflight.csv
   python stratux_sensors_to_foreflight_ffcsv.py sensors.csv -o foreflight.csv --tail-number DERDG --debug
+  python stratux_sensors_to_foreflight_ffcsv.py sensors.csv -o foreflight.csv \
+      --airports airports.csv --airport-threshold-nm 25
+
+Options:
+  --tail-number             Tail Number for Section 1 (default: DEABC)
+  --distance-units          Total distance units: nm|km|mi (default: nm)
+  --speed-units             Groundspeed units in input: kts|mps|kmh|auto (default: kts)
+  --sod-date                Anchor date YYYY-MM-DD if only seconds-of-day timestamps are present
+  --airports                Path to airports CSV (OurAirports format preferred)
+  --airport-threshold-nm    Max radius to accept nearest airport (default: 20)
+  --icao-only               Only accept 4-letter ICAO idents (default: true)
+  --debug                   Verbose diagnostics
 """
 
 import argparse, csv, os, sys, logging, math
@@ -141,9 +154,61 @@ def meters_to(total_m, units):
     if units == "mi": return total_m / 1609.344
     return total_m / 1852.0
 
+# ---------- Lightweight aerodrome detection ----------
+def load_airports_db(path, icao_only=True, types=None, debug=False):
+    """
+    Load a small airports DB from CSV (OurAirports format recommended).
+    Returns list of tuples: (ident, lat, lon).
+    Filters:
+      - icao_only: ident length==4, all letters/digits (no hyphen/space)
+      - types: keep only these types if provided (e.g., {'large_airport','medium_airport','small_airport'})
+    """
+    keep_types = set(types) if types else None
+    out = []
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        r = csv.DictReader(f)
+        # OurAirports typical fields: ident, type, name, latitude_deg, longitude_deg, iso_country, ...
+        for row in r:
+            ident = row.get("ident") or row.get("icao") or row.get("code")
+            t     = (row.get("type") or "").strip().lower()
+            lat   = row.get("latitude_deg") or row.get("lat") or row.get("Latitude")
+            lon   = row.get("longitude_deg") or row.get("lon") or row.get("Longitude")
+            if not ident or lat is None or lon is None:
+                continue
+            try:
+                latf = float(str(lat).strip())
+                lonf = float(str(lon).strip())
+            except Exception:
+                continue
+            if keep_types and t not in keep_types:
+                continue
+            ident_clean = ident.strip().upper()
+            if icao_only:
+                if len(ident_clean) != 4:  # ICAO is typically 4 chars
+                    continue
+                if not ident_clean.isalnum():
+                    continue
+            out.append((ident_clean, latf, lonf))
+    if debug:
+        print(f"Loaded airports: {len(out)}")
+    return out
+
+def nearest_airport_ident(lat, lon, airports, max_nm=20.0):
+    best_ident = ""
+    best_nm = 1e9
+    for ident, alat, alon in airports:
+        d_m = haversine_m(lat, lon, alat, alon)
+        d_nm = d_m / 1852.0
+        if d_nm < best_nm:
+            best_nm = d_nm
+            best_ident = ident
+    return best_ident if best_nm <= max_nm else ""
+
+# -----------------------------------------------------
+
 def main():
     ap = argparse.ArgumentParser(
-        description="Convert Stratux sensors.csv to ForeFlight CSV (two sections, dynamic metadata)",
+        description="Convert Stratux sensors.csv to ForeFlight CSV (two sections, dynamic metadata + aerodrome detection)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     ap.add_argument("input", nargs="?", help="Stratux sensors.csv")
@@ -154,6 +219,11 @@ def main():
     ap.add_argument("--speed-units", choices=["kts","mps","kmh","auto"], default="kts",
                     help="Units of GroundSpeed in the input file (converted to knots in output)")
     ap.add_argument("--sod-date", help="Anchor date YYYY-MM-DD if only seconds-of-day are present")
+    # Aerodrome detection:
+    ap.add_argument("--airports", help="Path to airports CSV (OurAirports format preferred)")
+    ap.add_argument("--airport-threshold-nm", type=float, default=20.0, help="Max radius to accept nearest airport")
+    ap.add_argument("--icao-only", type=lambda s: s.lower() not in {"0","false","no"}, default=True,
+                    help="Only accept 4-letter ICAO idents (true/false). Default: true")
     ap.add_argument("--debug", action="store_true", help="Verbose diagnostics")
     args = ap.parse_args()
 
@@ -258,12 +328,12 @@ def main():
 
             tsec = dt.timestamp()
             tracks.append({
-                "Timestamp": f"{tsec:.10g}",  # scientific-ish like ForeFlight samples
+                "Timestamp": f"{tsec:.10g}",
                 "Latitude": f"{lat:.7f}",
                 "Longitude": f"{lon:.7f}",
                 "Altitude": "" if alt_ft is None else f"{alt_ft:.1f}",
                 "Course":   "" if trk   is None else f"{trk:.1f}",
-                "Speed":    "" if spd_kts is None else f"{spd_kts:.1f}",  # knots
+                "Speed":    "" if spd_kts is None else f"{spd_kts:.1f}",
                 "Bank":     "" if bank_deg is None else f"{bank_deg:.2f}",
                 "Pitch":    "" if pitch_deg is None else f"{pitch_deg:.2f}",
                 "Horizontal Error": "" if her is None else f"{her:.2f}",
@@ -294,14 +364,35 @@ def main():
     ver_max, ver_min, ver_avg = stats(ver_vals)
     her_max, her_min, her_avg = stats(her_vals)
 
-    # Build Section 1 values (dynamic + placeholders)
+    # ----- Aerodrome detection (optional) -----
+    derived_origin = ""
+    derived_dest   = ""
+    if args.airports and os.path.exists(args.airports):
+        try:
+            db = load_airports_db(
+                args.airports,
+                icao_only=args.icao_only,
+                types={"large_airport","medium_airport","small_airport"},
+                debug=args.debug
+            )
+            if first_lat is not None and first_lon is not None:
+                derived_origin = nearest_airport_ident(first_lat, first_lon, db, max_nm=args.airport_threshold_nm)
+            if last_lat is not None and last_lon is not None:
+                derived_dest = nearest_airport_ident(last_lat, last_lon, db, max_nm=args.airport_threshold_nm)
+            if args.debug:
+                print(f"Derived Origin: {derived_origin or '(none)'} | Derived Destination: {derived_dest or '(none)'}")
+        except Exception as e:
+            if args.debug:
+                print(f"Airport DB load/detect failed: {e}")
+
+    # Build Section 1 values (dynamic + detected aerodromes + placeholders)
     meta_values = [
         "",                                  # Pilot
         args.tail_number,                    # Tail Number
-        "",                                  # Derived Origin
+        derived_origin,                      # Derived Origin (ICAO or "")
         f"{first_lat:.7f}",                  # Start Latitude
         f"{first_lon:.7f}",                  # Start Longitude
-        "",                                  # Derived Destination
+        derived_dest,                        # Derived Destination (ICAO or "")
         f"{last_lat:.7f}",                   # End Latitude
         f"{last_lon:.7f}",                   # End Longitude
         str(start_ms),                       # Start Time (ms)
@@ -336,6 +427,8 @@ def main():
         print(f"Rows: {len(tracks)} | Time: {first_dt.strftime('%Y-%m-%dT%H:%M:%SZ')} → {last_dt.strftime('%Y-%m-%dT%H:%M:%SZ')}")
         print(f"Distance: {total_dist:.3f} {args.distance_units}")
         print(f"Speed units (input→output): {args.speed_units}→kts")
+        if derived_origin or derived_dest:
+            print(f"Aerodromes: origin={derived_origin or '∅'} dest={derived_dest or '∅'}")
         print(f"Output: {args.output}")
 
 if __name__ == "__main__":
